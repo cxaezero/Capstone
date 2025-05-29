@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Streaming Dashboard</title>
+    <style>
+        body {
+            font-family: Arial;
+            margin: 0;
+            padding: 0;
+        }
+        .container {
+            display: grid;
+            grid-template-columns: 2fr 1fr;
+            height: 100vh;
+        }
+        .streams {
+            display: grid;
+            grid-template-rows: 1fr 1fr;
+            grid-template-columns: 1fr 1fr;
+            gap: 5px;
+            padding: 10px;
+            background: #111;
+        }
+        .stream-box {
+            background: #000;
+            border: 2px solid #333;
+        }
+        .stream-box img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+        }
+        .sidebar {
+            background: #f3f3f3;
+            padding: 10px;
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+        }
+        .log {
+            flex-grow: 1;
+            overflow-y: auto;
+            border: 1px solid #ccc;
+            background: #fff;
+            padding: 10px;
+            font-size: 14px;
+        }
+        .footer {
+            font-size: 14px;
+            margin-top: 10px;
+        }
+    </style>
+</head>
+<body>
+<div class="container">
+    <div class="streams">
+        <div class="stream-box"><!-- Top-left: static video --></div>
+        <div class="stream-box"><!-- Top-right: AI processed stream --></div>
+        <div class="stream-box"><img src="/stream/stream1"></div>
+        <div class="stream-box"><img src="/stream/stream2"></div>
+    </div>
+    <div class="sidebar">
+        <div>
+            <h3>Log</h3>
+            <div class="log" id="log-box">
+                <p>[00:00:01] Stream1 connected</p>
+                <p>[00:00:02] Stream2 connected</p>
+                <!-- JS로 로그 업데이트 가능 -->
+            </div>
+        </div>
+        <div class="footer">
+            <p><strong>Date/Time:</strong> {{ time }}</p>
+            <p><strong>Location:</strong> {{ location }}</p>
+        </div>
+    </div>
+</div>
+</body>
+</html>
