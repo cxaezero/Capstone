@@ -371,9 +371,8 @@ def stream_video(key):
 
 @app.route('/')
 def dashboard():
-    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     location = "Seoul, South Korea"
-    return render_template("dashboard.html", time=now, location=location)
+    return render_template("dashboard.html", location=location)
 
 @app.route('/log_stream')
 def log_stream():

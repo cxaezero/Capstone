@@ -35,6 +35,17 @@
             height: 100%;
             object-fit: contain;
         }
+        .stream-label {
+            position: absolute;
+            top: 5px;
+            left: 5px;
+            background: rgba(0, 0, 0, 0.8);
+            color: #fff;
+            padding: 2px 6px;
+            font-size: 14px;
+            font-weight: bold;
+            border: none;
+        }
         .sidebar {
             background: #f3f3f3;
             height: 100vh;
@@ -75,13 +86,14 @@
             </div>
         </div>
         <div class="footer">
-            <p><strong>Date/Time:</strong> {{ time }}</p>
+            <p><strong>Date/Time:</strong> <span id="datetime"></span></p>
             <p><strong>Location:</strong> {{ location }}</p>
         </div>
     </div>
 </div>
 
 <script>
+    //실시간 로그 업데이트
     const logBox = document.getElementById('log-box');
     const maxLogs = 14;  // 로그 최대 개수
 
@@ -104,6 +116,16 @@
         console.error("로그 스트림 연결 오류");
         evtSource.close();
     };
+
+    // 실시간 날짜/시간 갱신
+    function updateDateTime() {
+        const now = new Date();
+        const dateStr = now.toLocaleDateString('en-GB');
+        const timeStr = now.toLocaleTimeString('en-GB', { hour12: false });
+        document.getElementById('datetime').innerText = `${dateStr} ${timeStr}`;
+    }
+    setInterval(updateDateTime, 1000);
+    window.onload = updateDateTime;
 </script>
         
 </body>
