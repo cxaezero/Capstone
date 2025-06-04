@@ -9,6 +9,7 @@ from sklearn.metrics import auc, roc_curve, precision_recall_curve
 from tqdm import tqdm
 import numpy as np
 import random
+from focal_loss.focal_loss import FocalLoss
 
 # ===================== 하이퍼파라미터 =====================
 epochs = 100
@@ -43,10 +44,13 @@ class TripletLoss(nn.Module):
 class Loss(nn.Module):
     def __init__(self):
         super(Loss, self).__init__()
-        self.criterion = nn.BCEWithLogitsLoss()
+        # self.criterion = nn.BCEWithLogitsLoss()
+        weights = [2, 1, 1, 1, 1,
+                   1, 1, 1, 1, 1]  # 클래스별 가중치
+        self.criterion = FocalLoss(weights=weights, alpha=0.25, reduction='mean')
         self.triplet = TripletLoss()
 
-    def forward(self, scores, feats, targets, alpha=0.01):
+    def forward(self, scores, feats, targets, alpha=0.01): 
         scores = scores.squeeze()
         loss_ce = self.criterion(scores, targets)
         loss_triplet = self.triplet(feats)

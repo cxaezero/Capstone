@@ -23,7 +23,7 @@ IMG_SIZE = 160
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 MEAN = [0.45, 0.45, 0.45]
 STD = [0.225, 0.225, 0.225]
-ANOMALY_THRESHOLD = 0.80
+ANOMALY_THRESHOLD = 0.90
 ALERT_FRAMES = 10
 MAX_LOGS = 14
 LOG_INTERVAL = 5 # seconds
@@ -250,6 +250,7 @@ def generate_stream_deweather(key):
     frame_count = 0
     processed_frame = None
     anomaly_streak = 0
+    last_log_time = 0
 
     while True:
         ret, frame = cap.read()

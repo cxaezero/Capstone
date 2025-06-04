@@ -20,7 +20,7 @@ IMG_SIZE = (160, 160)
 BATCH_SIZE = 2
 EPOCHS = 10
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
-VIDEO_DIR = "/content/drive/MyDrive/pipeline/UCF_synth/UCF_Crimes/Videos"
+VIDEO_DIR = "/mnt/d/Capstone/data/UCF_Crimes/Videos"
 
 mean = [0.45, 0.45, 0.45]
 std = [0.225, 0.225, 0.225]
