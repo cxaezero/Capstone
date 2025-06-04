@@ -25,27 +25,26 @@ MEAN = [0.45, 0.45, 0.45]
 STD = [0.225, 0.225, 0.225]
 ANOMALY_THRESHOLD = 0.90
 ALERT_FRAMES = 10
-MAX_LOGS = 14
+MAX_LOGS = 25
 LOG_INTERVAL = 5 # seconds
 
 
 # log
 
 logs = deque(maxlen=MAX_LOGS)
+log_counter = 1
 logs_lock = threading.Lock()
 
 def event_stream():
-    last_index = 0
+    last_seen_id = 0
     while True:
         with logs_lock:
-            if len(logs) > last_index:
-                new_logs = list(logs)[:-last_index]
-                last_index = len(logs)
-            else:
-                new_logs = []
-        for log in new_logs:
+            new_logs = [msg for (log_id, msg) in logs if log_id > last_seen_id]
+            if new_logs:
+                last_seen_id = max(log_id for (log_id, _) in logs)
+        for log in reversed(new_logs):  # 최신 로그부터
             yield f"data: {log}\n\n"
-        time.sleep(1)  # 1초마다 체크
+        time.sleep(1)
 
 # video 
 
@@ -197,6 +196,7 @@ def generate_predefined_deweather(key):
     processed_frame = None
     anomaly_streak = 0
     last_log_time = 0
+    global log_counter
 
     while True:
         ret, frame = cap.read()
@@ -227,9 +227,10 @@ def generate_predefined_deweather(key):
                 now_time = time.time()
                 if now_time - last_log_time >= LOG_INTERVAL:
                     with logs_lock:
+                        log_counter += 1
                         now_str = datetime.datetime.now().strftime('%H:%M:%S')
                         log_msg = f"[ {now_str} - {key} ] 이상 상황 발생"
-                        logs.appendleft(log_msg)
+                        logs.appendleft((log_counter, log_msg))
                     last_log_time = now_time  # 로그 출력 시간 갱신
 
             success, jpeg = cv2.imencode('.jpg', processed_frame)
@@ -251,6 +252,7 @@ def generate_stream_deweather(key):
     processed_frame = None
     anomaly_streak = 0
     last_log_time = 0
+    global log_counter
 
     while True:
         ret, frame = cap.read()
@@ -282,9 +284,10 @@ def generate_stream_deweather(key):
                 now_time = time.time()
                 if now_time - last_log_time >= LOG_INTERVAL:
                     with logs_lock:
+                        log_counter += 1
                         now_str = datetime.datetime.now().strftime('%H:%M:%S')
                         log_msg = f"[ {now_str} - {key} ] 이상 상황 발생"
-                        logs.appendleft(log_msg)
+                        logs.appendleft((log_counter, log_msg))
                     last_log_time = now_time  # 로그 출력 시간 갱신
 
             success, jpeg = cv2.imencode('.jpg', processed_frame)
