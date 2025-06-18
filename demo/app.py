@@ -10,7 +10,6 @@ import os.path as osp
 from collections import deque
 from queue import Queue
 from PIL import Image 
-# print(osp.dirname( osp.dirname( osp.abspath(__file__) ) ))
 sys.path.append(osp.dirname( osp.dirname( osp.abspath(__file__) ) ))
 import threading
 from project.model.ESDNet import ESDNet
@@ -42,7 +41,7 @@ def event_stream():
             new_logs = [msg for (log_id, msg) in logs if log_id > last_seen_id]
             if new_logs:
                 last_seen_id = max(log_id for (log_id, _) in logs)
-        for log in reversed(new_logs):  # 최신 로그부터
+        for log in reversed(new_logs):
             yield f"data: {log}\n\n"
         time.sleep(1)
 
@@ -187,7 +186,7 @@ def inference_worker_2():
 threading.Thread(target=inference_worker_1, daemon=True).start()
 threading.Thread(target=inference_worker_2, daemon=True).start()
 
-def generate_predefined_deweather(key):
+def generate_predefined_deweather(key): # for stream0
     cap = cv2.VideoCapture("/home/cysong/capstone/Capstone/demo/demo_video.mp4")
     fps = cap.get(cv2.CAP_PROP_FPS)
     frame_delay = 1.0 / fps if fps > 0 else 0.033 
@@ -223,7 +222,6 @@ def generate_predefined_deweather(key):
                 h, w = processed_frame.shape[:2]
                 cv2.rectangle(processed_frame, (0, 0), (w - 1, h - 1), (0, 0, 255), 3)
                 
-                # 로그 추가
                 now_time = time.time()
                 if now_time - last_log_time >= LOG_INTERVAL:
                     with logs_lock:
@@ -231,7 +229,7 @@ def generate_predefined_deweather(key):
                         now_str = datetime.datetime.now().strftime('%H:%M:%S')
                         log_msg = f"[ {now_str} - {key} ] 이상 상황 발생"
                         logs.appendleft((log_counter, log_msg))
-                    last_log_time = now_time  # 로그 출력 시간 갱신
+                    last_log_time = now_time 
 
             success, jpeg = cv2.imencode('.jpg', processed_frame)
             if success:
@@ -272,9 +270,6 @@ def generate_stream_deweather(key):
             processed_frame, label, anomaly_streak = result_queue_2.get()
 
         if processed_frame is not None:
-            # fps = frame_count / (time.time() - start_time)
-            # cv2.putText(processed_frame, f"FPS: {fps:.2f} | {label}", (10, 20),
-            #             cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
 
             if anomaly_streak >= ALERT_FRAMES:
                 h, w = processed_frame.shape[:2]
@@ -288,7 +283,7 @@ def generate_stream_deweather(key):
                         now_str = datetime.datetime.now().strftime('%H:%M:%S')
                         log_msg = f"[ {now_str} - {key} ] 이상 상황 발생"
                         logs.appendleft((log_counter, log_msg))
-                    last_log_time = now_time  # 로그 출력 시간 갱신
+                    last_log_time = now_time
 
             success, jpeg = cv2.imencode('.jpg', processed_frame)
             if success:
@@ -296,64 +291,7 @@ def generate_stream_deweather(key):
 
         frame_count += 1
 
-'''def generate_stream_original(key): # 처리 x
-    cap = cv2.VideoCapture(f"rtmp://localhost:1935/live/{key}")
-    frame_buffer = deque(maxlen=CLIP_LEN)
-    anomlay_streak = 0
-    frame_count = 0
-
-    while True:
-#        start_time = time.time()
-        ret, frame = cap.read()
-        if not ret:
-            continue
-
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        frame_pil = Image.fromarray(frame_rgb)
-        frame_tensor = transform_frame(frame_pil).unsqueeze(0).to(DEVICE)
-
-        with torch.no_grad():
-            output, _, _ = deweather_model(frame_tensor)
-            clean_frame = output
-
-        clean_np = clean_frame.squeeze(0).cpu().numpy()
-        clean_np = np.transpose(clean_np, (1,2,0))
-        clean_np = np.clip(clean_np*255,0,255).astype(np.uint8)
-        clean_np = cv2.resize(clean_np, (352, 288))
-        clean_bgr = cv2.cvtColor(clean_np, cv2.COLOR_RGB2BGR)
-
-        frame_buffer.append(clean_frame.squeeze(0))
-
-        label = 'Collecting...'
-        if len(frame_buffer) == CLIP_LEN:
-            clip_tensor = torch.stack(list(frame_buffer), dim=0).permute(1,0,2,3)
-            normalized_clip = torch.stack([
-                normalize(clip_tensor[:,t,:,:]) for t in range(CLIP_LEN)
-            ], dim=1).unsqueeze(0).to(DEVICE)
-
-            with torch.no_grad():
-                feat = feature_extracter(normalized_clip)
-                pred, _ = classifier(feat)
-                score = torch.sigmoid(pred).item()
-                label = f"A: {score:.2f}"
-
-                anomlay_streak = anomlay_streak + 1 if score >= ANOMALY_THRESHOLD else 0
-
-#        elapsed = time.time() - start_time
-#        fps = frame_count / elapsed if elapsed > 0 else 0
-#        frame_count += 1
-
-#        cv2.putText(clean_bgr, f"FPS: {fps:.2f} | {label}", (10, 20),
-#                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0,255,255), 1)
-        
-        if anomlay_streak >= ALERT_FRAMES:
-            h, w = clean_bgr.shape[:2]
-            cv2.rectangle(clean_bgr, (0,0), (w-1, h-1),(0,0,255), 3)
-
-        _, jpeg = cv2.imencode('.jpg', clean_bgr)
-        yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + jpeg.tobytes() + b'\r\n')'''
-
-def generate_stream_original(key): # 모델 처리 x
+def generate_stream_original(key): # for stream2 and stream3
     cap = cv2.VideoCapture(f"rtmp://localhost:1935/live/{key}")
     while True:
         ret, frame = cap.read()
