@@ -6,6 +6,8 @@
 ### Description  
 This repository contains the Capstone Design project by the Department of Applied Artificial Intelligence at Seoul National University of Science and Technology. This project enhances low-quality CCTV video affected by adverse weather or low-light conditions and detects criminal activities in real-time using the improved video. Detection results are visualized through a web-based dashboard for intuitive monitoring and quick response.
 
+<img src="./images/capstone_overview.png" style="max-width: 100%; height: auto;" />
+
 ### References  
 - [ESDNet](https://github.com/CVMI-Lab/UHDM)  
 - [X3D](https://github.com/facebookresearch/SlowFast)
