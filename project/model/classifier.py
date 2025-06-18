@@ -44,8 +44,6 @@ class ConvBlock(nn.Module):
         x = x + self.ff(self.norm2(x))
         return x
 
-# main class
-
 class Model(nn.Module):
     def __init__(
         self,

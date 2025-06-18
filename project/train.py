@@ -9,9 +9,9 @@ from sklearn.metrics import auc, roc_curve, precision_recall_curve
 from tqdm import tqdm
 import numpy as np
 import random
-from focal_loss.focal_loss import FocalLoss
+from model.classifier import Model
 
-# ===================== 하이퍼파라미터 =====================
+# ===================== hyperparameters =====================
 epochs = 100
 batch_size = 4
 learning_rate = 1e-4
@@ -20,7 +20,7 @@ num_workers = 0
 save_path = "weight/De_final_model.pth"
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# ===================== Triplet Loss 정의 =====================
+# ===================== Triplet Loss =====================
 class TripletLoss(nn.Module):
     def __init__(self):
         super(TripletLoss, self).__init__()
@@ -40,14 +40,11 @@ class TripletLoss(nn.Module):
         a_d_min = torch.max(torch.zeros(bs // 2).to(feats.device), a_d_min)
         return torch.mean(n_d_max) + torch.mean(a_d_min)
 
-# ===================== Loss 모듈 정의 =====================
+# ===================== Loss module =====================
 class Loss(nn.Module):
     def __init__(self):
         super(Loss, self).__init__()
-        # self.criterion = nn.BCEWithLogitsLoss()
-        weights = [2, 1, 1, 1, 1,
-                   1, 1, 1, 1, 1]  # 클래스별 가중치
-        self.criterion = FocalLoss(weights=weights, alpha=0.25, reduction='mean')
+        self.criterion = nn.BCEWithLogitsLoss()
         self.triplet = TripletLoss()
 
     def forward(self, scores, feats, targets, alpha=0.01): 
@@ -63,7 +60,7 @@ def collate_fn(batch):
         return None
     return torch.utils.data.dataloader.default_collate(batch)
 
-# ===================== 학습 함수 =====================
+# ===================== train function =====================
 def train(loader, model, optimizer, scheduler, device, epoch):
     model.train()
     pred = []
@@ -98,9 +95,8 @@ def train(loader, model, optimizer, scheduler, device, epoch):
     print(f"[Epoch {epoch}] Loss: {loss.item():.4f}, PR AUC: {pr_auc:.4f}, ROC AUC: {roc_auc:.4f}")
     return loss.item()
 
-if __name__ == '__main__':
-    # ===================== 모델 로딩 및 학습 루프 =====================
-    from model.classifier import Model
+def main():
+    # Initialize model, optimizer, and scheduler
 
     classifier = Model(ff_mult=1, dims=(32, 32), depths=(1, 1))
     ckpt_path = "weight/De_final_model.pth"
@@ -116,10 +112,13 @@ if __name__ == '__main__':
     dataset = NPYPairedDataset(train_txt_path, root=npy_root)
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, collate_fn=collate_fn)
 
-    # ===================== 학습 시작 =====================
+    # Start training
     for epoch in range(epochs):
         train(loader, model, optimizer, scheduler, device, epoch)
 
-    # ===================== 모델 저장 =====================
     #torch.save(model.state_dict(), save_path)
-    #print(f"모델 저장 완료: {save_path}")
+    #print(f"model saved: {save_path}")
+    
+
+if __name__ == '__main__':
+    main()
