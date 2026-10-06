@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+
+# Virtual environments
+.venv/
+venv/
+
+# macOS
+.DS_Store
+
+# Training outputs and extracted features
+runs/
+*.npy
+
+# NOTE: demo/nginx-1.25.2/ (source + build artifacts) and weights/ are intentionally tracked.

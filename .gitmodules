@@ -1,0 +1,3 @@
+[submodule "demo/nginx-rtmp-module"]
+	path = demo/nginx-rtmp-module
+	url = https://github.com/arut/nginx-rtmp-module
