@@ -1,161 +1,136 @@
-import os
-import cv2
-import torch
-import torch.nn as nn
-import torch.optim as optim
-import numpy as np
+#!/usr/bin/env python
+"""Fine-tune ESDNet + X3D + classifier jointly on raw videos.
 
-from PIL import Image
-from tqdm import tqdm
-from glob import glob
-from sklearn.metrics import roc_curve, precision_recall_curve, auc
-from torch.utils.data import Dataset, DataLoader
-from torchvision.transforms import Normalize, Resize, ToTensor
+Batches are (normal, abnormal) clip pairs so the triplet loss assumption holds, clips start at a
+random position in each video, and X3D BatchNorm statistics are frozen. Weights are written as
+three separate state_dicts (deweather.pth / x3d.pth / classifier.pth) that the demo can load via
+CAPSTONE_DEWEATHER_WEIGHTS / CAPSTONE_CLASSIFIER_WEIGHTS and --x3d-weights.
 
-from model.ESDNet import ESDNet
-from model.classifier import Model
+Example:
+  python scripts/train_e2e.py --video-root data/UCF_Crimes/Videos --epochs 10
+"""
+from __future__ import annotations
 
-CLIP_LEN = 15
-IMG_SIZE = (160, 160)
-BATCH_SIZE = 2
-EPOCHS = 10
-DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
-VIDEO_DIR = "/mnt/d/Capstone/data/UCF_Crimes/Videos"
+import argparse
+import json
+import logging
+import sys
+import time
+from pathlib import Path
 
-mean, std = [0.45] * 3, [0.225] * 3
-normalize = Normalize(mean, std)
-resize = Resize(IMG_SIZE)
-totensor = ToTensor()
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-deweather_model = ESDNet(
-    en_feature_num=48,
-    en_inter_num=32,
-    de_feature_num=64,
-    de_inter_num=32,
-    sam_number=1
-).to(DEVICE)
-deweather_model.load_state_dict(torch.load("weight/deweathering_model.pth", map_location=DEVICE))
-deweather_model.train()
+import torch  # noqa: E402
+from torch import nn, optim  # noqa: E402
+from torch.utils.data import DataLoader  # noqa: E402
+from tqdm import tqdm  # noqa: E402
 
-x3d = torch.hub.load("facebookresearch/pytorchvideo", "x3d_s", pretrained=True)
-del x3d.blocks[-1]
-x3d = x3d.to(DEVICE).train()
+from capstone import config  # noqa: E402
+from capstone.data import PairedVideoDataset, collate_fn  # noqa: E402
+from capstone.evaluation import compute_metrics, unpack_batch  # noqa: E402
+from capstone.losses import CombinedLoss  # noqa: E402
+from capstone.models import build_classifier, build_deweather, build_x3d  # noqa: E402
+from capstone.preprocess import normalize_clip  # noqa: E402
 
-classifier = Model(ff_mult=1, dims=(32, 32), depths=(1, 1)).to(DEVICE).train()
+log = logging.getLogger("train_e2e")
 
-class TripletLoss(nn.Module):
-    def forward(self, feats, margin=100.0):
-        bs = feats.size(0)
-        normal = feats[:bs // 2]
-        abnormal = feats[bs // 2:]
-        dist_n = torch.cdist(normal, normal)
-        dist_a = torch.cdist(normal, abnormal)
-        max_d_n = torch.max(dist_n, dim=0)[0]
-        min_d_a = torch.min(dist_a, dim=0)[0]
-        return torch.mean(max_d_n) + torch.mean(torch.clamp(margin - min_d_a, min=0))
 
-class CombinedLoss(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.bce = nn.BCEWithLogitsLoss()
-        self.triplet = TripletLoss()
+def parse_args(argv=None):
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--video-root", required=True, help="directory with <class>/<video>.mp4")
+    p.add_argument("--epochs", type=int, default=10)
+    p.add_argument("--batch-size", type=int, default=2, help="pairs per batch (2x clips)")
+    p.add_argument("--clip-len", type=int, default=15, help="frames per clip (original end-to-end script: 15)")
+    p.add_argument("--img-size", type=int, default=config.IMG_SIZE)
+    p.add_argument("--variant", default=config.X3D_VARIANT)
+    p.add_argument("--lr", type=float, default=1e-4)
+    p.add_argument("--weight-decay", type=float, default=1e-5)
+    p.add_argument("--num-workers", type=int, default=0)
+    p.add_argument("--deweather-weights", default=config.DEWEATHER_WEIGHTS)
+    p.add_argument("--classifier-weights", default=None, help="default: train the classifier from scratch")
+    p.add_argument("--no-freeze-bn", action="store_true", help="let X3D BatchNorm statistics update")
+    p.add_argument("--max-steps", type=int, default=None, help="stop after this many optimizer steps (smoke test)")
+    p.add_argument("--out", type=Path, default=None)
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--device", default=None)
+    return p.parse_args(argv)
 
-    def forward(self, scores, feats, targets, alpha=0.01):
-        loss_bce = self.bce(scores.squeeze(), targets)
-        loss_triplet = self.triplet(feats)
-        return loss_bce + alpha * loss_triplet
 
-class VideoDataset(Dataset):
-    def __init__(self, video_dir):
-        self.video_paths = glob(os.path.join(video_dir, '*/*.mp4'))
-
-    def __len__(self):
-        return len(self.video_paths)
-
-    def __getitem__(self, idx):
-        path = self.video_paths[idx]
-        label = 0 if 'Normal' in path else 1
-        cap = cv2.VideoCapture(path)
-        frames = []
-
-        while len(frames) < CLIP_LEN:
-            ret, frame = cap.read()
-            if not ret:
-                break
-            image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)).resize(IMG_SIZE)
-            frames.append(totensor(image))
-        cap.release()
-
-        if len(frames) < CLIP_LEN:
-            return None
-        clip = torch.stack(frames[:CLIP_LEN], dim=1)
-        return clip, torch.tensor(label, dtype=torch.float32)
-
-def collate_fn(batch):
-    batch = [b for b in batch if b is not None]
-    if len(batch) == 0:
-        return None
-    return torch.utils.data.dataloader.default_collate(batch)
-
-def train(loader, deweather_model, x3d, classifier, optimizer, scheduler, loss_fn, epoch):
-    deweather_model.train()
+def set_train_mode(x3d: nn.Module, freeze_bn: bool) -> None:
     x3d.train()
-    classifier.train()
+    if freeze_bn:
+        for m in x3d.modules():
+            if isinstance(m, nn.modules.batchnorm._BatchNorm):
+                m.eval()
 
-    all_preds, all_labels = [], []
 
-    for _, batch in tqdm(enumerate(loader), total=len(loader), desc=f"Epoch {epoch}"):
-        if batch is None:
-            continue
+def forward_clips(clips, deweather, x3d, classifier):
+    """(B, 3, T, H, W) raw clips -> (logits, feats) through all three models."""
+    b, c, t, h, w = clips.shape
+    frames = clips.permute(0, 2, 1, 3, 4).reshape(b * t, c, h, w)
+    clean = deweather(frames)[0]
+    clean = clean.reshape(b, t, c, h, w).permute(0, 2, 1, 3, 4)
+    feats = x3d(normalize_clip(clean))
+    return classifier(feats)
 
-        clips, targets = batch
-        clips, targets = clips.to(DEVICE), targets.to(DEVICE)
 
-        B, C, T, H, W = clips.size()
-        clips = clips.permute(0, 2, 1, 3, 4).reshape(B * T, C, H, W)
+def main(argv=None):
+    args = parse_args(argv)
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+    torch.manual_seed(args.seed)
+    device = config.get_device(args.device)
+    out_dir = args.out or config.RUNS_DIR / ("e2e-" + time.strftime("%Y%m%d-%H%M%S"))
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-        clean, _, _ = deweather_model(clips)
-        clean = clean.view(B, T, C, H, W).permute(0, 2, 1, 3, 4)
+    deweather = build_deweather(weights=args.deweather_weights, device=device, eval_mode=False)
+    x3d = build_x3d(args.variant, device=device)
+    classifier = build_classifier(weights=args.classifier_weights, device=device, eval_mode=False)
 
-        for i in range(B):
-            clean[i] = torch.stack([normalize(clean[i][:, t]) for t in range(T)], dim=1)
-
-        feats = x3d(clean)
-        scores, feat_out = classifier(feats)
-
-        loss = loss_fn(scores, feat_out, targets)
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-        scheduler.step()
-
-        all_preds += torch.sigmoid(scores).detach().cpu().tolist()
-        all_labels += targets.cpu().tolist()
-
-    fpr, tpr, _ = roc_curve(all_labels, all_preds)
-    precision, recall, _ = precision_recall_curve(all_labels, all_preds)
-
-    print(f"[Epoch {epoch}] Loss: {loss.item():.4f} | PR AUC: {auc(recall, precision):.4f} | ROC AUC: {auc(fpr, tpr):.4f}")
-
-def main():
-    dataset = VideoDataset(VIDEO_DIR)
-    loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
-
-    params = list(deweather_model.parameters()) + list(x3d.parameters()) + list(classifier.parameters())
-    optimizer = optim.AdamW(params, lr=1e-4, weight_decay=1e-5)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
+    dataset = PairedVideoDataset(args.video_root, clip_len=args.clip_len, img_size=args.img_size)
+    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers,
+                        collate_fn=collate_fn)
+    params = list(deweather.parameters()) + list(x3d.parameters()) + list(classifier.parameters())
+    optimizer = optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
     loss_fn = CombinedLoss()
 
-    for epoch in range(EPOCHS):
-        train(loader, deweather_model, x3d, classifier, optimizer, scheduler, loss_fn, epoch)
+    step, history = 0, []
+    for epoch in range(args.epochs):
+        deweather.train()
+        classifier.train()
+        set_train_mode(x3d, freeze_bn=not args.no_freeze_bn)
+        predictions, targets, losses = [], [], []
+        for batch in tqdm(loader, desc=f"Epoch {epoch}"):
+            if batch is None:
+                continue
+            clips, labels = unpack_batch(batch, device)
+            scores, feats = forward_clips(clips, deweather, x3d, classifier)
+            loss = loss_fn(scores, feats, labels)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
 
-    torch.save({
-        'deweather': deweather_model.state_dict(),
-        'x3d': x3d.state_dict(),
-        'classifier': classifier.state_dict()
-    }, "weight/finetuned_end2end_all.pth")
+            losses.append(loss.item())
+            predictions.extend(torch.sigmoid(scores.reshape(-1)).detach().cpu().tolist())
+            targets.extend(labels.reshape(-1).cpu().tolist())
+            step += 1
+            if args.max_steps and step >= args.max_steps:
+                break
+        scheduler.step()
+        metrics = compute_metrics(predictions, targets)
+        metrics["loss"] = float(sum(losses) / max(len(losses), 1))
+        history.append({"epoch": epoch, **metrics})
+        log.info("epoch %d: %s", epoch, json.dumps(history[-1]))
+        if args.max_steps and step >= args.max_steps:
+            break
 
-    print("Model saved.")
+    torch.save(deweather.state_dict(), out_dir / "deweather.pth")
+    torch.save(x3d.state_dict(), out_dir / "x3d.pth")
+    torch.save(classifier.state_dict(), out_dir / "classifier.pth")
+    (out_dir / "history.json").write_text(json.dumps(history, indent=2))
+    log.info("saved deweather.pth / x3d.pth / classifier.pth to %s", out_dir)
+    return history
+
 
 if __name__ == "__main__":
     main()

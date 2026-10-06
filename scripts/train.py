@@ -1,116 +1,140 @@
-import os
-import torch
-import torch.nn as nn
-import torch.optim as optim
-import numpy as np
-from torch.utils.data import Dataset, DataLoader
-from sklearn.metrics import auc, roc_curve, precision_recall_curve
-from tqdm import tqdm
-from load_data import NPYPairedDataset
-from model.classifier import Model
+#!/usr/bin/env python
+"""Train the anomaly classifier on pre-extracted X3D features.
 
-# ===================== Configuration =====================
-epochs = 100
-batch_size = 4
-learning_rate = 1e-4
-weight_decay = 1e-5
-num_workers = 0
-save_path = "weight/De_final_model.pth"
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+Example (train from scratch, validate every epoch, keep best by ROC-AUC):
+  python scripts/train.py --train-root UCF_synth/De_X3D_Videos --val-root UCF_synth/De_X3D_Videos_T
 
-# ===================== Triplet Loss =====================
-class TripletLoss(nn.Module):
-    def __init__(self):
-        super().__init__()
+Fine-tune the shipped weights instead:   --init-weights weights/De_final_model.pth
+Resume an interrupted run:               --resume runs/<run>/checkpoint.pt
+"""
+from __future__ import annotations
 
-    def distance(self, x, y):
-        return torch.cdist(x, y, p=2)
+import argparse
+import json
+import logging
+import sys
+import time
+from pathlib import Path
 
-    def forward(self, feats, margin=100.0):
-        bs = feats.size(0)
-        normal_feats = feats[:bs // 2]
-        abnormal_feats = feats[bs // 2:]
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-        dist_n = self.distance(normal_feats, normal_feats)
-        dist_a = self.distance(normal_feats, abnormal_feats)
+import torch  # noqa: E402
+from torch import optim  # noqa: E402
+from torch.utils.data import DataLoader  # noqa: E402
+from tqdm import tqdm  # noqa: E402
 
-        max_n, _ = torch.max(dist_n, dim=0)
-        min_a, _ = torch.min(dist_a, dim=0)
-        min_a = torch.clamp(margin - min_a, min=0)
+from capstone import config  # noqa: E402
+from capstone.data import NPYPairedDataset, collate_fn, list_path_for  # noqa: E402
+from capstone.evaluation import compute_metrics, evaluate, unpack_batch  # noqa: E402
+from capstone.losses import CombinedLoss  # noqa: E402
+from capstone.models import build_classifier  # noqa: E402
 
-        return torch.mean(max_n) + torch.mean(min_a)
+log = logging.getLogger("train")
 
-# ===================== Combined Loss =====================
-class CombinedLoss(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.bce = nn.BCEWithLogitsLoss()
-        self.triplet = TripletLoss()
 
-    def forward(self, scores, feats, targets, alpha=0.01):
-        scores = scores.squeeze()
-        loss_bce = self.bce(scores, targets)
-        loss_triplet = self.triplet(feats)
-        return loss_bce + alpha * loss_triplet
+def parse_args(argv=None):
+    d = config.TRAIN_DEFAULTS
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--train-root", required=True)
+    p.add_argument("--train-list", default="ucf_x3d_train.txt")
+    p.add_argument("--val-root", default=None, help="enable per-epoch validation on this feature root")
+    p.add_argument("--val-list", default="ucf_x3d_test.txt")
+    p.add_argument("--epochs", type=int, default=d["epochs"])
+    p.add_argument("--batch-size", type=int, default=d["batch_size"], help="pairs per batch (2x samples)")
+    p.add_argument("--lr", type=float, default=d["lr"])
+    p.add_argument("--weight-decay", type=float, default=d["weight_decay"])
+    p.add_argument("--num-workers", type=int, default=d["num_workers"])
+    p.add_argument("--init-weights", default=None, help="start from this state_dict (default: random init)")
+    p.add_argument("--resume", default=None, help="checkpoint.pt written by a previous run")
+    p.add_argument("--out", type=Path, default=None, help=f"output dir (default {config.RUNS_DIR}/<timestamp>)")
+    p.add_argument("--missing", choices=["error", "skip"], default="error")
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--device", default=None)
+    return p.parse_args(argv)
 
-# ===================== Collate Function =====================
-def collate_fn(batch):
-    batch = [b for b in batch if b is not None]
-    if len(batch) == 0:
-        return None
-    return torch.utils.data.dataloader.default_collate(batch)
 
-# ===================== Training Function =====================
-def train(loader, model, optimizer, scheduler, device, epoch):
+def train_one_epoch(loader, model, optimizer, loss_fn, device, epoch: int) -> dict:
     model.train()
-    predictions, targets = [], []
-    loss_fn = CombinedLoss()
-
-    for _, batch in tqdm(enumerate(loader), total=len(loader)):
+    predictions, targets, losses = [], [], []
+    for batch in tqdm(loader, desc=f"Epoch {epoch}"):
         if batch is None:
             continue
-
-        n_input, n_label, a_input, a_label = batch
-        inputs = torch.cat((n_input, a_input), dim=0).to(device)
-        labels = torch.cat((n_label, a_label), dim=0).to(device)
-
+        inputs, labels = unpack_batch(batch, device)
         scores, feats = model(inputs)
-        predictions += scores.detach().cpu().tolist()
-        targets += labels.detach().cpu().tolist()
-
         loss = loss_fn(scores, feats, labels)
 
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
+
+        losses.append(loss.item())
+        predictions.extend(torch.sigmoid(scores.reshape(-1)).detach().cpu().tolist())
+        targets.extend(labels.reshape(-1).cpu().tolist())
+
+    metrics = compute_metrics(predictions, targets)  # note: computed in train mode (dropout on)
+    metrics["loss"] = float(sum(losses) / max(len(losses), 1))
+    return metrics
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+    torch.manual_seed(args.seed)
+    device = config.get_device(args.device)
+    out_dir = args.out or config.RUNS_DIR / time.strftime("%Y%m%d-%H%M%S")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    log.info("device=%s out=%s", device, out_dir)
+
+    model = build_classifier(weights=args.init_weights, device=device, eval_mode=False)
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)  # stepped once per epoch
+    loss_fn = CombinedLoss()
+
+    start_epoch, best_score = 0, float("-inf")
+    if args.resume:
+        ckpt = torch.load(args.resume, map_location=device, weights_only=True)
+        model.load_state_dict(ckpt["model"])
+        optimizer.load_state_dict(ckpt["optimizer"])
+        scheduler.load_state_dict(ckpt["scheduler"])
+        start_epoch, best_score = ckpt["epoch"] + 1, ckpt.get("best_score", best_score)
+        log.info("resumed from %s at epoch %d", args.resume, start_epoch)
+
+    train_set = NPYPairedDataset(list_path_for(args.train_list, config.LISTS_DIR), root=args.train_root,
+                                 missing=args.missing)
+    train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True,
+                              num_workers=args.num_workers, collate_fn=collate_fn)
+    val_loader = None
+    if args.val_root:
+        val_set = NPYPairedDataset(list_path_for(args.val_list, config.LISTS_DIR), root=args.val_root,
+                                   test_mode=True, missing=args.missing)
+        val_loader = DataLoader(val_set, batch_size=args.batch_size, shuffle=False,
+                                num_workers=args.num_workers, collate_fn=collate_fn)
+
+    history = []
+    for epoch in range(start_epoch, args.epochs):
+        train_metrics = train_one_epoch(train_loader, model, optimizer, loss_fn, device, epoch)
         scheduler.step()
+        record = {"epoch": epoch, "lr": scheduler.get_last_lr()[0], "train": train_metrics}
+        if val_loader is not None:
+            record["val"] = evaluate(val_loader, model, device, progress=False)
+            score = record["val"]["roc_auc"]
+        else:
+            score = -train_metrics["loss"]
+        history.append(record)
+        log.info("epoch %d: %s", epoch, json.dumps(record))
 
-    fpr, tpr, _ = roc_curve(targets, predictions)
-    roc_auc = auc(fpr, tpr)
-    precision, recall, _ = precision_recall_curve(targets, predictions)
-    pr_auc = auc(recall, precision)
-    print(f"[Epoch {epoch}] Loss: {loss.item():.4f}, PR AUC: {pr_auc:.4f}, ROC AUC: {roc_auc:.4f}")
-    return loss.item()
+        torch.save(model.state_dict(), out_dir / "last.pth")
+        torch.save({"model": model.state_dict(), "optimizer": optimizer.state_dict(),
+                    "scheduler": scheduler.state_dict(), "epoch": epoch, "best_score": best_score},
+                   out_dir / "checkpoint.pt")
+        if score == score and score > best_score:  # NaN-safe
+            best_score = score
+            torch.save(model.state_dict(), out_dir / "best.pth")
+        (out_dir / "history.json").write_text(json.dumps(history, indent=2))
 
-# ===================== Entry Point =====================
-def main():
-    model = Model(ff_mult=1, dims=(32, 32), depths=(1, 1))
-    model.load_state_dict(torch.load(save_path, map_location=device))
-    model = model.to(device)
+    log.info("done. best=%.4f weights in %s (best.pth / last.pth)", best_score, out_dir)
+    return history
 
-    optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
-    train_txt = "ucf_x3d_train.txt"
-    train_root = "UCF_synth/De_X3D_Videos"
-    train_set = NPYPairedDataset(train_txt, root=train_root)
-    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=num_workers, collate_fn=collate_fn)
-
-    for epoch in range(epochs):
-        train(train_loader, model, optimizer, scheduler, device, epoch)
-
-    torch.save(model.state_dict(), save_path)
-    print(f"model saved: {save_path}")
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

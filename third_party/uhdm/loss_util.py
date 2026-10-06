@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch
 import torchvision
-from utils.common import *
+from .common import *
 from torchvision import models as tv
 from torch.nn.parameter import Parameter
 import os

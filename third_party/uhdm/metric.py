@@ -1,7 +1,7 @@
 from .common import SSIM, PSNR, tensor2img
 from skimage.metrics import peak_signal_noise_ratio as ski_psnr
 from skimage.metrics import structural_similarity as ski_ssim
-from utils.matlab_ssim import MATLAB_SSIM
+from .matlab_ssim import MATLAB_SSIM
 import lpips
 import torch
 import numpy as np

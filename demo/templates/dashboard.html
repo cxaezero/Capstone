@@ -1,6 +1,7 @@
 <!DOCTYPE html>
 <html>
 <head>
+    <meta charset="utf-8">
     <title>Streaming Dashboard</title>
     <style>
         body {
@@ -21,7 +22,7 @@
             grid-template-columns: 1fr 1fr;
             gap: 5px;
             padding: 10px;
-            height: 100vh; 
+            height: 100vh;
             box-sizing: border-box;
         }
         .stream-box {
@@ -61,18 +62,14 @@
 <body>
 <div class="container">
     <div class="streams">
-        <div class="stream-box"><img src="/stream/stream0"></div> <!--top left-->
-        <div class="stream-box"><img src="/stream/stream1"></div> <!--top right-->
-        <div class="stream-box"><img src="/stream/stream2"></div> <!--bottom left-->
-        <div class="stream-box"><img src="/stream/stream3"></div> <!--bottom right-->
+        {% for key in stream_keys %}
+        <div class="stream-box"><img src="/stream/{{ key }}" alt="{{ key }}"></div>
+        {% endfor %}
     </div>
     <div class="sidebar">
         <div>
             <h3>Log</h3>
-            <div class="log" id="log-box">
-                <!-- <p>[00:00:01] Stream1 connected</p>
-                <p>[00:00:02] Stream2 connected</p> -->
-            </div>
+            <div class="log" id="log-box"></div>
         </div>
         <div class="footer">
             <p><strong>Date/Time:</strong> <span id="datetime"></span></p>
@@ -83,24 +80,22 @@
 
 <script>
     const logBox = document.getElementById('log-box');
-    const maxLogs = 24;
+    const maxLogs = {{ max_logs }};
 
     const evtSource = new EventSource('/log_stream');
 
     evtSource.onmessage = function(event) {
         const newLog = document.createElement('p');
         newLog.textContent = event.data;
-
         logBox.insertBefore(newLog, logBox.firstChild);
-
         while (logBox.childElementCount > maxLogs) {
-        logBox.removeChild(logBox.lastChild);
+            logBox.removeChild(logBox.lastChild);
         }
     };
 
+    // Do not close() here: EventSource reconnects on its own after a server restart.
     evtSource.onerror = function() {
-        console.error("로그 스트림 연결 오류");
-        evtSource.close();
+        console.warn("로그 스트림 연결 끊김, 재연결 대기 중");
     };
 
     function updateDateTime() {
@@ -112,6 +107,5 @@
     setInterval(updateDateTime, 1000);
     window.onload = updateDateTime;
 </script>
-        
 </body>
 </html>

@@ -1,324 +1,78 @@
-from flask import Flask, Response, render_template
-import cv2
-import torch
-import numpy as np
-from torchvision.transforms import ToTensor, Normalize, Resize, Compose
-import time
-import datetime
+"""Flask dashboard: four MJPEG streams + an SSE alert log.
+
+Run:  python demo/app.py [--host 0.0.0.0] [--port 5050] [--device cpu|cuda]
+Keys: stream0 = looped demo video (enhanced + detection), stream1 = RTMP enhanced + detection,
+      stream2/stream3 = RTMP relayed as-is. RTMP base URL and paths come from capstone.config.
+"""
+from __future__ import annotations
+
+import argparse
+import logging
+import os
 import sys
-import os.path as osp
-from collections import deque
-from queue import Queue
-from PIL import Image 
-sys.path.append(osp.dirname( osp.dirname( osp.abspath(__file__) ) ))
-import threading
-from project.model.ESDNet import ESDNet
-from project.model.classifier import Model
+from pathlib import Path
 
-# ============= hyperparameter =============
-app = Flask(__name__)
-CLIP_LEN = 13
-IMG_SIZE = 160
-DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
-MEAN = [0.45, 0.45, 0.45]
-STD = [0.225, 0.225, 0.225]
-ANOMALY_THRESHOLD = 0.90
-ALERT_FRAMES = 10
-MAX_LOGS = 25
-LOG_INTERVAL = 5 # seconds
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # allow running without `pip install -e .`
+
+from flask import Flask, Response, abort, jsonify, render_template  # noqa: E402
+
+from capstone import config  # noqa: E402
+from demo.streams import LogBus, StreamRegistry, mjpeg_frames, sse_events  # noqa: E402
+
+log = logging.getLogger(__name__)
+
+DEMO_LOCATION = os.environ.get("CAPSTONE_DEMO_LOCATION", "Seoul, South Korea")
 
 
-# log
+def create_app(registry=None, log_bus: LogBus | None = None, device=None) -> Flask:
+    """Build the app. ``registry`` only needs ``get(key)`` / ``keys()`` (injectable for tests)."""
+    app = Flask(__name__)
+    log_bus = log_bus or LogBus()
+    if registry is None:
+        device = device or config.get_device()
+        log.info("loading models on %s", device)
+        registry = StreamRegistry(device, log_bus)
+        registry.warm_up()
+    app.extensions["registry"] = registry
+    app.extensions["log_bus"] = log_bus
 
-logs = deque(maxlen=MAX_LOGS)
-log_counter = 1
-logs_lock = threading.Lock()
+    @app.route("/")
+    def dashboard():
+        return render_template("dashboard.html", location=DEMO_LOCATION, max_logs=config.MAX_LOGS,
+                               stream_keys=registry.keys())
 
-def event_stream():
-    last_seen_id = 0
-    while True:
-        with logs_lock:
-            new_logs = [msg for (log_id, msg) in logs if log_id > last_seen_id]
-            if new_logs:
-                last_seen_id = max(log_id for (log_id, _) in logs)
-        for log in reversed(new_logs):
-            yield f"data: {log}\n\n"
-        time.sleep(1)
-
-# video 
-
-transform_frame = Compose([
-    Resize((IMG_SIZE, IMG_SIZE)),
-    ToTensor()
-])
-normalize = Normalize(mean=MEAN, std=STD)
-
-def load_deweather_model(device):
-    deweather_model = ESDNet(
-        en_feature_num=48,
-        en_inter_num=32,
-        de_feature_num=64,
-        de_inter_num=32,
-        sam_number=1
-    ).to(device)
-
-    load_path="/home/cysong/capstone/Capstone/project/weight/deweathering_model.pth"
-    ckpt = torch.load(load_path, map_location=device)
-    state_dict = ckpt if load_path.endswith('.pth') else ckpt['state_dict']
-    deweather_model.load_state_dict(state_dict)
-    deweather_model.eval()
-
-    return deweather_model
-
-def load_classifier_model(device):
-    classifier = Model(ff_mult=1, dims=(32, 32), depths=(1, 1)).to(device)
-
-    load_path="/home/cysong/capstone/Capstone/project/weight/De_final_model.pth"
-    ckpt = torch.load(load_path, map_location=device)
-    state_dict = ckpt if load_path.endswith('.pth') else ckpt['state_dict']
-    classifier.load_state_dict(state_dict)
-    classifier.eval()
-
-    return classifier
-
-def load_feature_extracter(device):
-    feature_extracter = torch.hub.load('facebookresearch/pytorchvideo', 'x3d_s', pretrained=True)
-    feature_extracter = feature_extracter.eval().to(device)
-    del feature_extracter.blocks[-1]
-
-    return feature_extracter
-
-def load_models(device):
-    deweather = load_deweather_model(device)
-    classifier = load_classifier_model(device)
-    feature_ext = load_feature_extracter(device)
-    return deweather, classifier, feature_ext
-
-deweather_model_1, classifier_1, feature_extracter_1 = load_models(DEVICE)
-deweather_model_2, classifier_2, feature_extracter_2 = load_models(DEVICE)
-
-
-frame_queue_1 = Queue(maxsize=5)
-result_queue_1 = Queue(maxsize=5)
-frame_queue_2 = Queue(maxsize=5)
-result_queue_2 = Queue(maxsize=5)
-
-def inference_worker_1():
-    frame_buffer = deque(maxlen=CLIP_LEN)
-    anomaly_streak = 0
-    last_score = 0.0
-
-    while True:
-        item = frame_queue_1.get()
-        if item is None:
-            break
-        tensor_frame, raw_bgr = item
-
-        with torch.no_grad():
-            clean_frame, _, _ = deweather_model_1(tensor_frame)
-        
-        clean_np = clean_frame.squeeze(0).cpu().numpy()
-        clean_np = np.transpose(clean_np, (1,2,0))
-        clean_np = np.clip(clean_np * 255, 0, 255).astype(np.uint8)
-        clean_np = cv2.resize(clean_np, (352, 288))
-        processed_frame = cv2.cvtColor(clean_np, cv2.COLOR_RGB2BGR)
-
-        frame_buffer.append(clean_frame.squeeze(0))
-        if len(frame_buffer) == CLIP_LEN:
-            clip_tensor = torch.stack(list(frame_buffer), dim=0).permute(1,0,2,3)
-            normalized_clip = torch.stack([
-                normalize(clip_tensor[:,t]) for t in range(CLIP_LEN)
-            ], dim=1).unsqueeze(0).to(DEVICE)
-
-            with torch.no_grad():
-                feat = feature_extracter_1(normalized_clip)
-                pred, _ = classifier_1(feat)
-                score = torch.sigmoid(pred).item()
-                last_score = score
-                label = f"A: {score:.2f}"
-                anomaly_streak = anomaly_streak + 1 if score >= ANOMALY_THRESHOLD else 0
-        else:
-            score = last_score
-            label = f"A: {score:.2f}" if score else "Collection..."
-
-        result_queue_1.put((processed_frame, label, anomaly_streak))
-
-def inference_worker_2():
-    frame_buffer = deque(maxlen=CLIP_LEN)
-    anomaly_streak = 0
-    last_score = 0.0
-
-    while True:
-        item = frame_queue_2.get()
-        if item is None:
-            break
-        tensor_frame, raw_bgr = item
-
-        with torch.no_grad():
-            clean_frame, _, _ = deweather_model_2(tensor_frame)
-        
-        clean_np = clean_frame.squeeze(0).cpu().numpy()
-        clean_np = np.transpose(clean_np, (1,2,0))
-        clean_np = np.clip(clean_np * 255, 0, 255).astype(np.uint8)
-        clean_np = cv2.resize(clean_np, (352, 288))
-        processed_frame = cv2.cvtColor(clean_np, cv2.COLOR_RGB2BGR)
-
-        frame_buffer.append(clean_frame.squeeze(0))
-        if len(frame_buffer) == CLIP_LEN:
-            clip_tensor = torch.stack(list(frame_buffer), dim=0).permute(1,0,2,3)
-            normalized_clip = torch.stack([
-                normalize(clip_tensor[:,t]) for t in range(CLIP_LEN)
-            ], dim=1).unsqueeze(0).to(DEVICE)
-
-            with torch.no_grad():
-                feat = feature_extracter_2(normalized_clip)
-                pred, _ = classifier_2(feat)
-                score = torch.sigmoid(pred).item()
-                last_score = score
-                label = f"A: {score:.2f}"
-                anomaly_streak = anomaly_streak + 1 if score >= ANOMALY_THRESHOLD else 0
-        else:
-            score = last_score
-            label = f"A: {score:.2f}" if score else "Collection..."
-
-        result_queue_2.put((processed_frame, label, anomaly_streak))
-
-threading.Thread(target=inference_worker_1, daemon=True).start()
-threading.Thread(target=inference_worker_2, daemon=True).start()
-
-def generate_predefined_deweather(key): # for stream0
-    cap = cv2.VideoCapture("/home/cysong/capstone/Capstone/demo/demo_video.mp4")
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    frame_delay = 1.0 / fps if fps > 0 else 0.033 
-
-    frame_count = 0
-    processed_frame = None
-    anomaly_streak = 0
-    last_log_time = 0
-    global log_counter
-
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-            continue
-
-        start_time = time.time()
-
+    @app.route("/stream/<key>")
+    def stream_video(key):
         try:
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            tensor = transform_frame(Image.fromarray(frame_rgb)).unsqueeze(0).to(DEVICE)
+            stream = registry.get(key)
+        except KeyError:
+            abort(404)
+        return Response(mjpeg_frames(stream.jpeg), mimetype="multipart/x-mixed-replace; boundary=frame")
 
-            if not frame_queue_1.full():
-                frame_queue_1.put_nowait((tensor, frame.copy()))
-        except Exception as e:
-            print("전처리 오류:", e)
+    @app.route("/log_stream")
+    def log_stream():
+        return Response(sse_events(log_bus), mimetype="text/event-stream",
+                        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
-        if not result_queue_1.empty():
-            processed_frame, label, anomaly_streak = result_queue_1.get()
+    @app.route("/healthz")
+    def healthz():
+        return jsonify(status="ok", streams=list(registry.keys()), recent_logs=log_bus.recent())
 
-        if processed_frame is not None:
-            if anomaly_streak >= ALERT_FRAMES:
-                h, w = processed_frame.shape[:2]
-                cv2.rectangle(processed_frame, (0, 0), (w - 1, h - 1), (0, 0, 255), 3)
-                
-                now_time = time.time()
-                if now_time - last_log_time >= LOG_INTERVAL:
-                    with logs_lock:
-                        log_counter += 1
-                        now_str = datetime.datetime.now().strftime('%H:%M:%S')
-                        log_msg = f"[ {now_str} - {key} ] 이상 상황 발생"
-                        logs.appendleft((log_counter, log_msg))
-                    last_log_time = now_time 
-
-            success, jpeg = cv2.imencode('.jpg', processed_frame)
-            if success:
-                yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + jpeg.tobytes() + b'\r\n')
-
-        frame_count += 1
-
-        elapsed = time.time() - start_time
-        sleep_time = frame_delay - elapsed
-        
-        if sleep_time > 0:
-            time.sleep(sleep_time)
+    return app
 
 
-def generate_stream_deweather(key):
-    cap = cv2.VideoCapture(f"rtmp://localhost:1935/live/{key}")
-    frame_count = 0
-    processed_frame = None
-    anomaly_streak = 0
-    last_log_time = 0
-    global log_counter
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--port", type=int, default=config.DEMO_PORT)
+    parser.add_argument("--device", default=None, help="cpu / cuda / mps (default: auto, or CAPSTONE_DEVICE)")
+    parser.add_argument("--debug", action="store_true")
+    args = parser.parse_args(argv)
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            continue
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    app = create_app(device=config.get_device(args.device))
+    app.run(host=args.host, port=args.port, threaded=True, debug=args.debug, use_reloader=False)
 
-        try:
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            tensor = transform_frame(Image.fromarray(frame_rgb)).unsqueeze(0).to(DEVICE)
 
-            if not frame_queue_2.full():
-                frame_queue_2.put_nowait((tensor, frame.copy()))
-        except Exception as e:
-            print("전처리 오류:", e)
-
-        if not result_queue_2.empty():
-            processed_frame, label, anomaly_streak = result_queue_2.get()
-
-        if processed_frame is not None:
-
-            if anomaly_streak >= ALERT_FRAMES:
-                h, w = processed_frame.shape[:2]
-                cv2.rectangle(processed_frame, (0, 0), (w - 1, h - 1), (0, 0, 255), 3)
-                
-                # 로그 추가
-                now_time = time.time()
-                if now_time - last_log_time >= LOG_INTERVAL:
-                    with logs_lock:
-                        log_counter += 1
-                        now_str = datetime.datetime.now().strftime('%H:%M:%S')
-                        log_msg = f"[ {now_str} - {key} ] 이상 상황 발생"
-                        logs.appendleft((log_counter, log_msg))
-                    last_log_time = now_time
-
-            success, jpeg = cv2.imencode('.jpg', processed_frame)
-            if success:
-                yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + jpeg.tobytes() + b'\r\n')
-
-        frame_count += 1
-
-def generate_stream_original(key): # for stream2 and stream3
-    cap = cv2.VideoCapture(f"rtmp://localhost:1935/live/{key}")
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            continue
-        _, jpeg = cv2.imencode('.jpg', frame)
-        yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + jpeg.tobytes() + b'\r\n')
-
-@app.route('/stream/<key>')
-def stream_video(key):
-    if key == "stream0":
-        return Response(generate_predefined_deweather(key), mimetype='multipart/x-mixed-replace; boundary=frame')
-    elif key == "stream1":
-        return Response(generate_stream_deweather(key), mimetype='multipart/x-mixed-replace; boundary=frame')
-    else: # key == "stream2" or key == "stream3"
-        return Response(generate_stream_original(key), mimetype='multipart/x-mixed-replace; boundary=frame')
-
-# show dashboard
-
-@app.route('/')
-def dashboard():
-    location = "Seoul, South Korea"
-    return render_template("dashboard.html", location=location)
-
-@app.route('/log_stream')
-def log_stream():
-    return Response(event_stream(), mimetype='text/event-stream')
-
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5050)
+if __name__ == "__main__":
+    main()

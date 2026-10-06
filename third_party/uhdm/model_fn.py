@@ -3,8 +3,8 @@ import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision
-from utils.loss_util import *
-from utils.common import *
+from .loss_util import *
+from .common import *
 from torch.nn.parameter import Parameter
 from functools import partial
 import time
